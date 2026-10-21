@@ -25,6 +25,7 @@ jobs:
           EOF
           cat > app/build.gradle <<'EOF'
           plugins { id 'com.android.application' }
+          dependencies { implementation 'com.squareup.okhttp3:okhttp:4.12.0' }
           android {
               namespace 'com.sumon.ai'
               compileSdk 34
@@ -153,6 +154,28 @@ jobs:
               static String get(Context c, String k, String d) { return c.getSharedPreferences("sumon", 0).getString(k, d); }
               static void put(Context c, String k, String v) { c.getSharedPreferences("sumon", 0).edit().putString(k, v).apply(); }
 
+              static final String[][] PERSONAS = {
+                  {"NORMAL", "Balanced, clear and helpful."},
+                  {"FRIENDLY", "Warm, upbeat and casual, like a good friend."},
+                  {"PROFESSIONAL", "Concise, formal and precise."},
+                  {"FUNNY", "Playful and witty; light jokes, never at the user's expense."},
+                  {"COMPANION", "Caring and supportive; never claim to be human or to have a body."},
+                  {"GF_MODE", "Affectionate and sweet in tone; never claim to be human or to have a body; no sexual content; instantly respect a request to change tone or topic."},
+                  {"TEACHER", "Patient; explain step by step and check understanding."},
+                  {"DEVELOPER", "Technical and direct; give precise, practical engineering help."},
+                  {"HUNGRY", "Food-obsessed and funny; relates things to food while still helping."},
+                  {"NAUTANKI", "Dramatic, theatrical and exaggerated, but still genuinely helpful."}};
+
+              static String livePrompt(Context c) {
+                  String p = get(c, "persona", "NORMAL"), ins = PERSONAS[0][1];
+                  for (String[] x : PERSONAS) if (x[0].equals(p)) ins = x[1];
+                  return "You are Sumon, a persistent female voice assistant living on the user's Android phone. Keep replies short and conversational, like speech. "
+                      + "You control the phone with tools. After opening an app or typing, call read_screen to check before tapping; never claim a task is done unless a tool result confirms it. "
+                      + "Before sending any message or doing anything irreversible, ask the user to confirm. When the user says goodbye or asks you to stop, call end_session. "
+                      + "Language: reply in the language the user speaks, turn by turn (Bengali, Hindi, Hinglish or English); never translate what they said. "
+                      + "Personality: " + p + ". " + ins + " Never claim to be human; no sexually explicit content; stop any topic when asked.";
+              }
+
               static final String SYS = "You are Sumon AI, a friendly female voice assistant that controls an Android phone. "
                   + "Reply with ONLY one JSON object: {\"say\":\"short spoken reply in the user's language\",\"actions\":[],\"continue\":false}. "
                   + "Action types: {\"t\":\"open_app\",\"name\":\"WhatsApp\"} {\"t\":\"url\",\"url\":\"https://...\"} {\"t\":\"search\",\"q\":\"\"} "
@@ -233,6 +256,7 @@ jobs:
 
               final Handler h = new Handler(Looper.getMainLooper());
               final Runnable goR = this::go;
+              LiveSession live;
               SpeechRecognizer sr;
               TextToSpeech tts;
               AudioManager am;
@@ -283,12 +307,16 @@ jobs:
               }
 
               @Override public int onStartCommand(Intent i, int f, int id) {
-                  if (i != null && "TALK".equals(i.getAction()) && !busy) { cmd = true; tries = 0; say(T("জি, বলুন", "Yes, tell me")); }
+                  if (i != null && "TALK".equals(i.getAction()) && !busy) {
+                      if (liveOn()) startLive("");
+                      else { cmd = true; tries = 0; say(T("জি, বলুন", "Yes, tell me")); }
+                  }
                   return START_STICKY;
               }
 
               @Override public void onDestroy() {
                   inst = null;
+                  if (live != null) live.stop();
                   beep(false);
                   try { sr.destroy(); } catch (Exception e) { }
                   if (tts != null) tts.shutdown();
@@ -343,8 +371,33 @@ jobs:
                   return null;
               }
 
+              boolean liveOn() { return Ai.get(this, "prov", "gemini").equals("gemini") && !Ai.get(this, "key", "").isEmpty(); }
+
+              void startLive(String rem) {
+                  if (busy) return;
+                  busy = true;
+                  beep(false);
+                  try { sr.cancel(); } catch (Exception e) { }
+                  log("লাইভ কথোপকথন শুরু…");
+                  st("লাইভ: সংযোগ হচ্ছে…", true);
+                  live = new LiveSession(this, new LiveSession.CB() {
+                      public void onReady() { st("লাইভ: কথা বলুন", true); }
+                      public void onText(String w, String t) { log(w + ": " + t); }
+                      public void onEnd(boolean ok, String why) {
+                          h.post(() -> {
+                              live = null; busy = false;
+                              if (!ok) log("লাইভ সংযোগ হয়নি: " + why + "\n(⚙ থেকে Live model ও key দেখুন)");
+                              st("\"হেই সুমন\" বলুন", false);
+                              listen();
+                          });
+                      }
+                  }, rem);
+                  live.start();
+              }
+
               void woke(String rem) {
                   if (busy) return;
+                  if (liveOn()) { startLive(rem); return; }
                   beep(false);
                   if (rem.length() >= 3) process(rem);
                   else { cmd = true; tries = 0; say(T("জি, বলুন", "Yes, tell me")); }
@@ -412,6 +465,225 @@ jobs:
                           break;
                       }
                   }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/sumon/ai/LiveSession.java <<'EOF'
+          package com.sumon.ai;
+
+          import android.content.Context;
+          import android.media.*;
+          import android.media.audiofx.AcousticEchoCanceler;
+          import android.media.audiofx.NoiseSuppressor;
+          import android.util.Base64;
+          import okhttp3.*;
+          import okio.ByteString;
+          import org.json.*;
+          import java.util.concurrent.*;
+
+          public class LiveSession extends WebSocketListener {
+              interface CB { void onReady(); void onText(String who, String text); void onEnd(boolean wasReady, String why); }
+
+              final Context ctx;
+              final CB cb;
+              final String first;
+              WebSocket ws;
+              AudioRecord rec;
+              AudioTrack trk;
+              final BlockingQueue<byte[]> q = new LinkedBlockingQueue<>();
+              final StringBuilder in = new StringBuilder(), out = new StringBuilder();
+              volatile boolean ready, stopped;
+              volatile long endAt, last = System.currentTimeMillis();
+
+              LiveSession(Context c, CB cb, String first) { this.ctx = c; this.cb = cb; this.first = first == null ? "" : first; }
+
+              static JSONObject fd(String n, String d, String... p) throws Exception {
+                  JSONObject pr = new JSONObject(), o = new JSONObject().put("name", n).put("description", d);
+                  JSONArray req = new JSONArray();
+                  for (String s : p) { pr.put(s, new JSONObject().put("type", "STRING")); req.put(s); }
+                  if (p.length > 0) o.put("parameters", new JSONObject().put("type", "OBJECT").put("properties", pr).put("required", req));
+                  return o;
+              }
+
+              static JSONArray tools() throws Exception {
+                  return new JSONArray()
+                      .put(fd("open_app", "Open an installed app by its name", "name"))
+                      .put(fd("search_web", "Search Google in the browser", "query"))
+                      .put(fd("youtube_search", "Search YouTube", "query"))
+                      .put(fd("open_url", "Open a web address", "url"))
+                      .put(fd("dial", "Open the phone dialer with a number", "number"))
+                      .put(fd("read_screen", "Read the visible text on the phone screen ([tap]=clickable, [input]=text field)"))
+                      .put(fd("tap_text", "Tap the on-screen element showing this text", "text"))
+                      .put(fd("type_text", "Type text into the focused or first input field", "text"))
+                      .put(fd("press_enter", "Press enter or search on the keyboard"))
+                      .put(fd("scroll_screen", "Scroll the screen; direction is up or down", "direction"))
+                      .put(fd("go_back", "Press the back button"))
+                      .put(fd("go_home", "Go to the home screen"))
+                      .put(fd("end_session", "End the live conversation when the user says goodbye or stop"));
+              }
+
+              void start() {
+                  String url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="
+                      + Ai.get(ctx, "key", "");
+                  OkHttpClient c = new OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS)
+                      .connectTimeout(20, TimeUnit.SECONDS).pingInterval(20, TimeUnit.SECONDS).build();
+                  ws = c.newWebSocket(new Request.Builder().url(url).build(), this);
+              }
+
+              void stop() { end("stop"); }
+
+              @Override public void onOpen(WebSocket w, Response r) {
+                  try {
+                      JSONObject setup = new JSONObject()
+                          .put("model", Ai.get(ctx, "live_model", "models/gemini-3.1-flash-live-preview"))
+                          .put("generationConfig", new JSONObject().put("responseModalities", new JSONArray().put("AUDIO"))
+                              .put("speechConfig", new JSONObject().put("voiceConfig", new JSONObject().put("prebuiltVoiceConfig",
+                                  new JSONObject().put("voiceName", Ai.get(ctx, "voice", "Aoede"))))))
+                          .put("systemInstruction", new JSONObject().put("parts", new JSONArray().put(new JSONObject().put("text", Ai.livePrompt(ctx)))))
+                          .put("inputAudioTranscription", new JSONObject())
+                          .put("outputAudioTranscription", new JSONObject())
+                          .put("tools", new JSONArray().put(new JSONObject().put("functionDeclarations", tools())));
+                      w.send(new JSONObject().put("setup", setup).toString());
+                  } catch (Exception e) { end("setup: " + e.getMessage()); }
+              }
+
+              @Override public void onMessage(WebSocket w, String t) { handle(t); }
+              @Override public void onMessage(WebSocket w, ByteString b) { handle(b.utf8()); }
+              @Override public void onClosing(WebSocket w, int code, String reason) { end("closed " + code + " " + reason); }
+              @Override public void onFailure(WebSocket w, Throwable t, Response r) { end(String.valueOf(t.getMessage())); }
+
+              void handle(String t) {
+                  try {
+                      JSONObject j = new JSONObject(t);
+                      if (j.has("setupComplete")) {
+                          ready = true;
+                          startAudio();
+                          if (!first.isEmpty()) ws.send(new JSONObject().put("realtimeInput", new JSONObject().put("text", first)).toString());
+                          cb.onReady();
+                          return;
+                      }
+                      JSONObject tc = j.optJSONObject("toolCall");
+                      if (tc != null) {
+                          JSONArray fc = tc.optJSONArray("functionCalls");
+                          if (fc != null) for (int i = 0; i < fc.length(); i++) tool(fc.getJSONObject(i));
+                      }
+                      JSONObject sc = j.optJSONObject("serverContent");
+                      if (sc == null) return;
+                      last = System.currentTimeMillis();
+                      if (sc.optBoolean("interrupted")) {
+                          q.clear(); endAt = 0;
+                          try { trk.pause(); trk.flush(); trk.play(); } catch (Exception e) { }
+                      }
+                      JSONObject mt = sc.optJSONObject("modelTurn");
+                      if (mt != null && mt.optJSONArray("parts") != null) {
+                          JSONArray ps = mt.getJSONArray("parts");
+                          for (int i = 0; i < ps.length(); i++) {
+                              JSONObject d = ps.getJSONObject(i).optJSONObject("inlineData");
+                              if (d != null && d.optString("mimeType").startsWith("audio/pcm")) {
+                                  byte[] b = Base64.decode(d.getString("data"), Base64.DEFAULT);
+                                  endAt = Math.max(endAt, System.currentTimeMillis()) + b.length / 48;
+                                  q.offer(b);
+                              }
+                          }
+                      }
+                      JSONObject it = sc.optJSONObject("inputTranscription");
+                      if (it != null) in.append(it.optString("text"));
+                      JSONObject ot = sc.optJSONObject("outputTranscription");
+                      if (ot != null) out.append(ot.optString("text"));
+                      if (sc.optBoolean("turnComplete")) {
+                          if (in.length() > 0) { cb.onText("আপনি", in.toString().trim()); in.setLength(0); }
+                          if (out.length() > 0) { cb.onText("সুমন", out.toString().trim()); out.setLength(0); }
+                      }
+                  } catch (Exception e) { }
+              }
+
+              void tool(JSONObject fc) {
+                  new Thread(() -> {
+                      try {
+                          String id = fc.optString("id"), name = fc.optString("name");
+                          JSONObject a = fc.optJSONObject("args");
+                          if (a == null) a = new JSONObject();
+                          String res = exec(name, a);
+                          last = System.currentTimeMillis();
+                          cb.onText("⚙", name + " → " + res.substring(0, Math.min(40, res.length())).replace('\n', ' '));
+                          JSONObject fr = new JSONObject().put("id", id).put("name", name).put("response", new JSONObject().put("result", res));
+                          ws.send(new JSONObject().put("toolResponse", new JSONObject().put("functionResponses", new JSONArray().put(fr))).toString());
+                          if (name.equals("end_session")) { Thread.sleep(5000); end("bye"); }
+                      } catch (Exception e) { }
+                  }).start();
+              }
+
+              String exec(String n, JSONObject a) throws Exception {
+                  JSONObject o = new JSONObject();
+                  switch (n) {
+                      case "open_app": o.put("t", "open_app").put("name", a.optString("name")); break;
+                      case "search_web": o.put("t", "search").put("q", a.optString("query")); break;
+                      case "youtube_search": o.put("t", "youtube").put("q", a.optString("query")); break;
+                      case "open_url": o.put("t", "url").put("url", a.optString("url")); break;
+                      case "dial": o.put("t", "dial").put("num", a.optString("number")); break;
+                      case "tap_text": o.put("t", "click").put("text", a.optString("text")); break;
+                      case "type_text": o.put("t", "type").put("text", a.optString("text")); break;
+                      case "press_enter": o.put("t", "enter"); break;
+                      case "scroll_screen": o.put("t", "scroll").put("dir", a.optString("direction", "down")); break;
+                      case "go_back": o.put("t", "back"); break;
+                      case "go_home": o.put("t", "home"); break;
+                      case "read_screen": return PhoneAccessibilityService.dump();
+                      case "end_session": return "ok";
+                      default: return "unknown tool";
+                  }
+                  return Actions.run(ctx, o);
+              }
+
+              void startAudio() {
+                  int min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                  rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, AudioFormat.CHANNEL_IN_MONO,
+                      AudioFormat.ENCODING_PCM_16BIT, Math.max(min, 4096));
+                  try {
+                      if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(rec.getAudioSessionId());
+                      if (NoiseSuppressor.isAvailable()) NoiseSuppressor.create(rec.getAudioSessionId());
+                  } catch (Exception e) { }
+                  int tmin = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                  trk = new AudioTrack.Builder()
+                      .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANT)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                      .setAudioFormat(new AudioFormat.Builder().setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                          .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                      .setBufferSizeInBytes(tmin * 4).setTransferMode(AudioTrack.MODE_STREAM).build();
+                  trk.play();
+                  rec.startRecording();
+                  new Thread(this::micLoop).start();
+                  new Thread(this::playLoop).start();
+              }
+
+              void micLoop() {
+                  byte[] buf = new byte[2048];
+                  while (!stopped) {
+                      int n = rec.read(buf, 0, buf.length);
+                      if (n <= 0) continue;
+                      long now = System.currentTimeMillis();
+                      if (now - last > 45000) { end("idle"); break; }
+                      if (now < endAt + 450) continue;
+                      ws.send("{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\""
+                          + Base64.encodeToString(buf, 0, n, Base64.NO_WRAP) + "\"}}}");
+                  }
+              }
+
+              void playLoop() {
+                  try {
+                      while (!stopped) {
+                          byte[] b = q.poll(200, TimeUnit.MILLISECONDS);
+                          if (b != null) trk.write(b, 0, b.length);
+                      }
+                  } catch (Exception e) { }
+              }
+
+              synchronized void end(String why) {
+                  if (stopped) return;
+                  stopped = true;
+                  try { ws.close(1000, null); } catch (Exception e) { }
+                  try { rec.stop(); rec.release(); } catch (Exception e) { }
+                  try { trk.stop(); trk.release(); } catch (Exception e) { }
+                  cb.onEnd(ready, why);
               }
           }
           EOF
@@ -532,17 +804,29 @@ jobs:
                   LinearLayout l = new LinearLayout(this);
                   l.setOrientation(LinearLayout.VERTICAL);
                   l.setPadding(dp(20), dp(10), dp(20), 0);
-                  final String[] keys = {"prov", "key", "model", "base", "lang"};
-                  String[] hints = {"Provider: gemini অথবা openai", "API Key", "Model", "Base URL (openai হলে)", "ভাষা: bn-BD / en-US"};
-                  String[] defs = {"gemini", "", "gemini-flash-latest", "https://api.openai.com/v1", "bn-BD"};
-                  final EditText[] e = new EditText[5];
-                  for (int i = 0; i < 5; i++) {
+                  final String[] keys = {"key", "live_model", "voice", "lang", "prov", "model", "base"};
+                  String[] hints = {"Gemini API Key", "Live model", "ভয়েস (Aoede, Kore, Leda, Zephyr)", "কমান্ড ভাষা (সাধারণ মোড)", "Provider: gemini অথবা openai", "Model (সাধারণ মোড)", "Base URL (openai হলে)"};
+                  String[] defs = {"", "models/gemini-3.1-flash-live-preview", "Aoede", "bn-BD", "gemini", "gemini-flash-latest", "https://api.openai.com/v1"};
+                  final EditText[] e = new EditText[keys.length];
+                  for (int i = 0; i < keys.length; i++) {
                       e[i] = new EditText(this);
                       e[i].setHint(hints[i]); e[i].setText(Ai.get(this, keys[i], defs[i])); e[i].setSingleLine();
                       l.addView(e[i]);
                   }
-                  new AlertDialog.Builder(this).setTitle("সেটিংস").setView(l)
-                      .setPositiveButton("সেভ", (d, w) -> { for (int i = 0; i < 5; i++) Ai.put(this, keys[i], e[i].getText().toString().trim()); })
+                  final String[] pn = new String[Ai.PERSONAS.length];
+                  for (int i = 0; i < pn.length; i++) pn[i] = Ai.PERSONAS[i][0];
+                  final Spinner sp = new Spinner(this);
+                  sp.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, pn));
+                  String cur = Ai.get(this, "persona", "NORMAL");
+                  for (int i = 0; i < pn.length; i++) if (pn[i].equals(cur)) sp.setSelection(i);
+                  l.addView(sp);
+                  ScrollView s2 = new ScrollView(this);
+                  s2.addView(l);
+                  new AlertDialog.Builder(this).setTitle("সেটিংস").setView(s2)
+                      .setPositiveButton("সেভ", (d, w) -> {
+                          for (int i = 0; i < keys.length; i++) Ai.put(this, keys[i], e[i].getText().toString().trim());
+                          Ai.put(this, "persona", pn[sp.getSelectedItemPosition()]);
+                      })
                       .setNegativeButton("বাতিল", null).show();
               }
 
