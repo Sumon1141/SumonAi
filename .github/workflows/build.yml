@@ -149,6 +149,7 @@ jobs:
           import java.net.URL;
 
           public class Ai {
+              static volatile boolean bn = true;
               static String get(Context c, String k, String d) { return c.getSharedPreferences("sumon", 0).getString(k, d); }
               static void put(Context c, String k, String v) { c.getSharedPreferences("sumon", 0).edit().putString(k, v).apply(); }
 
@@ -161,6 +162,7 @@ jobs:
                   + "([tap] = clickable, [input] = text field). Never claim something is done unless your actions did it. Keep say under 25 words.";
 
               static String ask(Context c, String prompt) throws Exception {
+                  if (!bn) prompt += "\nIMPORTANT: write say in English.";
                   String key = get(c, "key", "");
                   if (key.isEmpty()) throw new Exception("সেটিংসে API Key দিন");
                   String model = get(c, "model", "gemini-flash-latest");
@@ -227,7 +229,7 @@ jobs:
               static volatile Runnable ui;
               static volatile String status = "বন্ধ";
               static volatile boolean hot;
-              static final String[] NAMES = {"sumon", "suman", "simon", "shumon", "somon", "sumoni", "সুমন", "সুমোন", "সোমন", "শুমন", "সুমান"};
+              static final String[] NAMES = {"sumon", "suman", "simon", "shumon", "somon", "sumoni", "summon", "sumun", "samon", "sumen", "shuman", "sumo", "সুমন", "সূমন", "সুমোন", "সোমন", "শুমন", "সুমান", "সুমণ"};
 
               final Handler h = new Handler(Looper.getMainLooper());
               final Runnable goR = this::go;
@@ -242,6 +244,8 @@ jobs:
               static void log(String s) { synchronized (LOG) { LOG.append(s).append("\n\n"); if (LOG.length() > 5000) LOG.delete(0, 1500); } ping(); }
               static void st(String s, boolean hh) { status = s; hot = hh; ping(); }
               static void ping() { Runnable r = ui; if (r != null) new Handler(Looper.getMainLooper()).post(r); }
+
+              static String T(String b, String e) { return Ai.bn ? b : e; }
 
               @Override public IBinder onBind(Intent i) { return null; }
 
@@ -258,7 +262,8 @@ jobs:
                   else startForeground(1, n);
                   tts = new TextToSpeech(this, s -> {
                       if (s != TextToSpeech.SUCCESS) return;
-                      if (tts.setLanguage(new Locale("bn", "BD")) < 0) tts.setLanguage(new Locale("en", "IN"));
+                      Ai.bn = tts.setLanguage(new Locale("bn", "BD")) >= 0;
+                      if (!Ai.bn) { tts.setLanguage(new Locale("en", "IN")); log("বাংলা ভয়েস নেই, তাই ইংরেজিতে উত্তর দেবে। Google Text-to-speech-এ বাংলা ভয়েস ডাউনলোড করুন।"); }
                       tts.setPitch(1.3f);
                       try {
                           String lang = tts.getVoice().getLocale().getLanguage();
@@ -278,7 +283,7 @@ jobs:
               }
 
               @Override public int onStartCommand(Intent i, int f, int id) {
-                  if (i != null && "TALK".equals(i.getAction()) && !busy) { cmd = true; tries = 0; say("জি, বলুন"); }
+                  if (i != null && "TALK".equals(i.getAction()) && !busy) { cmd = true; tries = 0; say(T("জি, বলুন", "Yes, tell me")); }
                   return START_STICKY;
               }
 
@@ -298,7 +303,9 @@ jobs:
                   if (!ttsOk) return;
                   pend++;
                   h.post(() -> { try { sr.cancel(); } catch (Exception e) { } });
-                  tts.speak(t, TextToSpeech.QUEUE_ADD, null, "u" + System.nanoTime());
+                  int r = tts.speak(t, TextToSpeech.QUEUE_ADD, null, "u" + System.nanoTime());
+                  if (r != TextToSpeech.SUCCESS) { pend--; log("(ভয়েস বাজানো যায়নি)"); }
+                  else h.postDelayed(() -> { if (pend > 0) { pend = 0; if (!busy) listen(); } }, 15000);
               }
 
               void beep(boolean m) {
@@ -317,7 +324,7 @@ jobs:
                       if (sr == null) { sr = SpeechRecognizer.createSpeechRecognizer(this); sr.setRecognitionListener(this); }
                       Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                           .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, Ai.get(this, "lang", "bn-BD"))
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, cmd ? Ai.get(this, "lang", "bn-BD") : Ai.get(this, "wlang", "en-US"))
                           .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
                       beep(true);
                       sr.startListening(i);
@@ -340,18 +347,22 @@ jobs:
                   if (busy) return;
                   beep(false);
                   if (rem.length() >= 3) process(rem);
-                  else { cmd = true; tries = 0; say("জি, বলুন"); }
+                  else { cmd = true; tries = 0; say(T("জি, বলুন", "Yes, tell me")); }
               }
 
               @Override public void onPartialResults(Bundle b) {
-                  if (cmd || busy) return;
-                  String r = wake(best(b));
+                  if (busy) return;
+                  String hp = best(b);
+                  if (!hp.isEmpty()) st("শুনছি: " + hp, cmd);
+                  if (cmd) return;
+                  String r = wake(hp);
                   if (r != null) { try { sr.cancel(); } catch (Exception e) { } woke(r); }
               }
 
               @Override public void onResults(Bundle b) {
                   String t = best(b);
                   if (t.isEmpty()) { listen(); return; }
+                  log("শুনলাম: " + t);
                   if (cmd) { cmd = false; tries = 0; process(t); return; }
                   String r = wake(t);
                   if (r != null) woke(r); else listen();
@@ -363,7 +374,8 @@ jobs:
                   if (cmd && ++tries >= 2) cmd = false;
                   if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) { try { sr.destroy(); } catch (Exception x) { } sr = null; }
                   boolean quiet = e == SpeechRecognizer.ERROR_NO_MATCH || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT;
-                  h.postDelayed(goR, quiet ? 150 : 1500);
+                  if (!quiet) log("মাইক ত্রুটি কোড " + e + (e == 2 || e == 1 || e == 4 ? " (ইন্টারনেট দেখুন)" : ""));
+                  h.postDelayed(goR, quiet ? 60 : 2000);
               }
 
               @Override public void onReadyForSpeech(Bundle b) { }
@@ -396,7 +408,7 @@ jobs:
                           if (!j.optBoolean("continue")) break;
                           Thread.sleep(1500);
                       } catch (Exception e) {
-                          say("সমস্যা হয়েছে: " + e.getMessage());
+                          say(T("সমস্যা হয়েছে: ", "Problem: ") + e.getMessage());
                           break;
                       }
                   }
