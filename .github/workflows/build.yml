@@ -1,0 +1,683 @@
+name: Build Sumon AI APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          mkdir -p app app/src/main app/src/main/java/com/sumon/ai app/src/main/res/xml
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "SumonAI"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.sumon.ai'
+              compileSdk 34
+              defaultConfig { applicationId 'com.sumon.ai'; minSdk 26; targetSdk 34; versionCode 1; versionName '1.0' }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application android:label="Sumon AI" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask"
+                      android:showWhenLocked="true" android:turnScreenOn="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".ListenService" android:exported="false" android:foregroundServiceType="microphone" />
+                  <service android:name=".PhoneAccessibilityService" android:exported="true" android:label="Sumon AI"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/accessibility.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100" />
+          EOF
+          cat > app/src/main/java/com/sumon/ai/Actions.java <<'EOF'
+          package com.sumon.ai;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.net.Uri;
+          import org.json.JSONObject;
+
+          public class Actions {
+              static String run(Context c, JSONObject a) {
+                  Context x = PhoneAccessibilityService.inst != null ? PhoneAccessibilityService.inst : c;
+                  try {
+                      switch (a.optString("t")) {
+                          case "open_app": return openApp(x, a.optString("name"));
+                          case "url": return view(x, a.optString("url"));
+                          case "search": return view(x, "https://www.google.com/search?q=" + Uri.encode(a.optString("q")));
+                          case "youtube": return view(x, "https://www.youtube.com/results?search_query=" + Uri.encode(a.optString("q")));
+                          case "dial": return view(x, "tel:" + a.optString("num"));
+                          case "click": return PhoneAccessibilityService.click(a.optString("text")) ? "ok" : "not found";
+                          case "type": return PhoneAccessibilityService.type(a.optString("text")) ? "ok" : "no input";
+                          case "enter": return PhoneAccessibilityService.enter() ? "ok" : "failed";
+                          case "back": return PhoneAccessibilityService.glob(AccessibilityService.GLOBAL_ACTION_BACK) ? "ok" : "failed";
+                          case "home": return PhoneAccessibilityService.glob(AccessibilityService.GLOBAL_ACTION_HOME) ? "ok" : "failed";
+                          case "recents": return PhoneAccessibilityService.glob(AccessibilityService.GLOBAL_ACTION_RECENTS) ? "ok" : "failed";
+                          case "scroll": return PhoneAccessibilityService.scroll(!a.optString("dir", "down").equals("up")) ? "ok" : "failed";
+                          case "wait": Thread.sleep(Math.min(a.optLong("ms", 1000), 6000)); return "ok";
+                          default: return "unknown action";
+                      }
+                  } catch (Exception e) {
+                      return "error " + e.getMessage();
+                  }
+              }
+
+              static String view(Context x, String url) {
+                  Intent i = new Intent(url.startsWith("tel:") ? Intent.ACTION_DIAL : Intent.ACTION_VIEW, Uri.parse(url));
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  x.startActivity(i);
+                  return "ok";
+              }
+
+              static String openApp(Context x, String name) {
+                  PackageManager pm = x.getPackageManager();
+                  String q = name.toLowerCase();
+                  Intent main = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+                  for (ResolveInfo ri : pm.queryIntentActivities(main, 0)) {
+                      String l = ri.loadLabel(pm).toString().toLowerCase();
+                      if (l.contains(q) || q.contains(l)) {
+                          Intent i = pm.getLaunchIntentForPackage(ri.activityInfo.packageName);
+                          if (i == null) continue;
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          x.startActivity(i);
+                          return "ok";
+                      }
+                  }
+                  return "app not found";
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/sumon/ai/Ai.java <<'EOF'
+          package com.sumon.ai;
+
+          import android.content.Context;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.io.*;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          public class Ai {
+              static String get(Context c, String k, String d) { return c.getSharedPreferences("sumon", 0).getString(k, d); }
+              static void put(Context c, String k, String v) { c.getSharedPreferences("sumon", 0).edit().putString(k, v).apply(); }
+
+              static final String SYS = "You are Sumon AI, a friendly female voice assistant that controls an Android phone. "
+                  + "Reply with ONLY one JSON object: {\"say\":\"short spoken reply in the user's language\",\"actions\":[],\"continue\":false}. "
+                  + "Action types: {\"t\":\"open_app\",\"name\":\"WhatsApp\"} {\"t\":\"url\",\"url\":\"https://...\"} {\"t\":\"search\",\"q\":\"\"} "
+                  + "{\"t\":\"youtube\",\"q\":\"\"} {\"t\":\"dial\",\"num\":\"\"} {\"t\":\"click\",\"text\":\"visible label\"} {\"t\":\"type\",\"text\":\"\"} "
+                  + "{\"t\":\"enter\"} {\"t\":\"back\"} {\"t\":\"home\"} {\"t\":\"recents\"} {\"t\":\"scroll\",\"dir\":\"down\"} {\"t\":\"wait\",\"ms\":1500}. "
+                  + "Set continue=true when you must see the screen after the actions to go on; the next message will then contain SCREEN text "
+                  + "([tap] = clickable, [input] = text field). Never claim something is done unless your actions did it. Keep say under 25 words.";
+
+              static String ask(Context c, String prompt) throws Exception {
+                  String key = get(c, "key", "");
+                  if (key.isEmpty()) throw new Exception("সেটিংসে API Key দিন");
+                  String model = get(c, "model", "gemini-flash-latest");
+                  if (get(c, "prov", "gemini").equals("gemini")) {
+                      JSONObject b = new JSONObject()
+                          .put("system_instruction", new JSONObject().put("parts", new JSONArray().put(new JSONObject().put("text", SYS))))
+                          .put("contents", new JSONArray().put(new JSONObject().put("role", "user")
+                              .put("parts", new JSONArray().put(new JSONObject().put("text", prompt)))))
+                          .put("generationConfig", new JSONObject().put("responseMimeType", "application/json"));
+                      String r = post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
+                          b.toString(), new String[]{"x-goog-api-key", key});
+                      return new JSONObject(r).getJSONArray("candidates").getJSONObject(0)
+                          .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text");
+                  }
+                  String base = get(c, "base", "https://api.openai.com/v1");
+                  JSONObject b = new JSONObject().put("model", model).put("messages", new JSONArray()
+                      .put(new JSONObject().put("role", "system").put("content", SYS))
+                      .put(new JSONObject().put("role", "user").put("content", prompt)));
+                  String r = post(base + "/chat/completions", b.toString(), new String[]{"Authorization", "Bearer " + key});
+                  return new JSONObject(r).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content");
+              }
+
+              static JSONObject json(String s) throws Exception {
+                  return new JSONObject(s.substring(s.indexOf('{'), s.lastIndexOf('}') + 1));
+              }
+
+              static String post(String url, String body, String[] hdr) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  c.setRequestMethod("POST");
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(60000);
+                  c.setDoOutput(true);
+                  c.setRequestProperty("Content-Type", "application/json");
+                  for (int i = 0; i + 1 < hdr.length; i += 2) c.setRequestProperty(hdr[i], hdr[i + 1]);
+                  c.getOutputStream().write(body.getBytes("UTF-8"));
+                  int code = c.getResponseCode();
+                  InputStream in = code < 400 ? c.getInputStream() : c.getErrorStream();
+                  ByteArrayOutputStream o = new ByteArrayOutputStream();
+                  byte[] buf = new byte[4096];
+                  int n;
+                  while (in != null && (n = in.read(buf)) > 0) o.write(buf, 0, n);
+                  String s = o.toString("UTF-8");
+                  if (code >= 400) throw new Exception("HTTP " + code + " " + s.substring(0, Math.min(160, s.length())));
+                  return s;
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/sumon/ai/ListenService.java <<'EOF'
+          package com.sumon.ai;
+
+          import android.app.*;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.media.AudioManager;
+          import android.os.*;
+          import android.speech.*;
+          import android.speech.tts.*;
+          import org.json.*;
+          import java.util.*;
+
+          public class ListenService extends Service implements RecognitionListener {
+              static volatile ListenService inst;
+              static final StringBuilder LOG = new StringBuilder();
+              static volatile Runnable ui;
+              static volatile String status = "বন্ধ";
+              static volatile boolean hot;
+              static final String[] NAMES = {"sumon", "suman", "simon", "shumon", "somon", "sumoni", "সুমন", "সুমোন", "সোমন", "শুমন", "সুমান"};
+
+              final Handler h = new Handler(Looper.getMainLooper());
+              final Runnable goR = this::go;
+              SpeechRecognizer sr;
+              TextToSpeech tts;
+              AudioManager am;
+              boolean ttsOk, cmd;
+              volatile boolean busy;
+              volatile int pend;
+              int tries;
+
+              static void log(String s) { synchronized (LOG) { LOG.append(s).append("\n\n"); if (LOG.length() > 5000) LOG.delete(0, 1500); } ping(); }
+              static void st(String s, boolean hh) { status = s; hot = hh; ping(); }
+              static void ping() { Runnable r = ui; if (r != null) new Handler(Looper.getMainLooper()).post(r); }
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              @Override public void onCreate() {
+                  super.onCreate();
+                  inst = this;
+                  am = (AudioManager) getSystemService(AUDIO_SERVICE);
+                  ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
+                      .createNotificationChannel(new NotificationChannel("sumon", "Sumon AI", NotificationManager.IMPORTANCE_LOW));
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
+                  Notification n = new Notification.Builder(this, "sumon").setContentTitle("Sumon AI চালু আছে")
+                      .setContentText("\"হেই সুমন\" বলুন").setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(pi).build();
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                  else startForeground(1, n);
+                  tts = new TextToSpeech(this, s -> {
+                      if (s != TextToSpeech.SUCCESS) return;
+                      if (tts.setLanguage(new Locale("bn", "BD")) < 0) tts.setLanguage(new Locale("en", "IN"));
+                      tts.setPitch(1.3f);
+                      try {
+                          String lang = tts.getVoice().getLocale().getLanguage();
+                          for (Voice v : tts.getVoices())
+                              if (v.getName().toLowerCase().contains("female") && v.getLocale().getLanguage().equals(lang)) { tts.setVoice(v); break; }
+                      } catch (Exception e) { }
+                      tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                          @Override public void onStart(String id) { }
+                          @Override public void onDone(String id) { spoken(); }
+                          @Override public void onError(String id) { spoken(); }
+                      });
+                      ttsOk = true;
+                  });
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) log("এই ফোনে স্পিচ রিকগনিশন নেই (Google অ্যাপ লাগবে)");
+                  log("Sumon AI চালু। \"হেই সুমন\" বলুন।");
+                  listen();
+              }
+
+              @Override public int onStartCommand(Intent i, int f, int id) {
+                  if (i != null && "TALK".equals(i.getAction()) && !busy) { cmd = true; tries = 0; say("জি, বলুন"); }
+                  return START_STICKY;
+              }
+
+              @Override public void onDestroy() {
+                  inst = null;
+                  beep(false);
+                  try { sr.destroy(); } catch (Exception e) { }
+                  if (tts != null) tts.shutdown();
+                  st("বন্ধ", false);
+                  super.onDestroy();
+              }
+
+              void spoken() { h.post(() -> { if (--pend <= 0) { pend = 0; if (!busy) listen(); } }); }
+
+              void say(String t) {
+                  log("সুমন: " + t);
+                  if (!ttsOk) return;
+                  pend++;
+                  h.post(() -> { try { sr.cancel(); } catch (Exception e) { } });
+                  tts.speak(t, TextToSpeech.QUEUE_ADD, null, "u" + System.nanoTime());
+              }
+
+              void beep(boolean m) {
+                  try {
+                      int f = m ? AudioManager.ADJUST_MUTE : AudioManager.ADJUST_UNMUTE;
+                      am.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, f, 0);
+                      am.adjustStreamVolume(AudioManager.STREAM_SYSTEM, f, 0);
+                  } catch (Exception e) { }
+              }
+
+              void listen() { if (pend > 0 || busy) return; h.removeCallbacks(goR); h.postDelayed(goR, 300); }
+
+              void go() {
+                  if (pend > 0 || busy) return;
+                  try {
+                      if (sr == null) { sr = SpeechRecognizer.createSpeechRecognizer(this); sr.setRecognitionListener(this); }
+                      Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, Ai.get(this, "lang", "bn-BD"))
+                          .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                      beep(true);
+                      sr.startListening(i);
+                      st(cmd ? "বলুন, শুনছি…" : "\"হেই সুমন\" বলুন", cmd);
+                  } catch (Exception e) { h.postDelayed(goR, 2000); }
+              }
+
+              String best(Bundle b) {
+                  ArrayList<String> l = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  return l == null || l.isEmpty() ? "" : l.get(0);
+              }
+
+              String wake(String t) {
+                  String l = t.toLowerCase(Locale.ROOT);
+                  for (String n : NAMES) { int i = l.indexOf(n); if (i >= 0) return t.substring(i + n.length()).trim(); }
+                  return null;
+              }
+
+              void woke(String rem) {
+                  if (busy) return;
+                  beep(false);
+                  if (rem.length() >= 3) process(rem);
+                  else { cmd = true; tries = 0; say("জি, বলুন"); }
+              }
+
+              @Override public void onPartialResults(Bundle b) {
+                  if (cmd || busy) return;
+                  String r = wake(best(b));
+                  if (r != null) { try { sr.cancel(); } catch (Exception e) { } woke(r); }
+              }
+
+              @Override public void onResults(Bundle b) {
+                  String t = best(b);
+                  if (t.isEmpty()) { listen(); return; }
+                  if (cmd) { cmd = false; tries = 0; process(t); return; }
+                  String r = wake(t);
+                  if (r != null) woke(r); else listen();
+              }
+
+              @Override public void onError(int e) {
+                  if (busy || pend > 0) return;
+                  if (e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) { log("মাইক্রোফোন অনুমতি দিন"); stopSelf(); return; }
+                  if (cmd && ++tries >= 2) cmd = false;
+                  if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) { try { sr.destroy(); } catch (Exception x) { } sr = null; }
+                  boolean quiet = e == SpeechRecognizer.ERROR_NO_MATCH || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT;
+                  h.postDelayed(goR, quiet ? 150 : 1500);
+              }
+
+              @Override public void onReadyForSpeech(Bundle b) { }
+              @Override public void onBeginningOfSpeech() { }
+              @Override public void onRmsChanged(float v) { }
+              @Override public void onBufferReceived(byte[] b) { }
+              @Override public void onEndOfSpeech() { }
+              @Override public void onEvent(int t, Bundle b) { }
+
+              void process(String text) {
+                  busy = true;
+                  log("আপনি: " + text);
+                  st("ভাবছি…", false);
+                  new Thread(() -> { agent(text); busy = false; h.post(this::listen); }).start();
+              }
+
+              void agent(String goal) {
+                  StringBuilder done = new StringBuilder();
+                  for (int s = 0; s < 8; s++) {
+                      try {
+                          String p = "GOAL: " + goal + (s > 0 ? "\nDONE SO FAR: " + done + "\nSCREEN:\n" + PhoneAccessibilityService.dump() : "");
+                          JSONObject j = Ai.json(Ai.ask(this, p));
+                          String sp = j.optString("say");
+                          if (!sp.isEmpty()) say(sp);
+                          JSONArray a = j.optJSONArray("actions");
+                          if (a != null) for (int i = 0; i < a.length(); i++) {
+                              JSONObject o = a.getJSONObject(i);
+                              done.append(o.optString("t")).append("=").append(Actions.run(this, o)).append("; ");
+                          }
+                          if (!j.optBoolean("continue")) break;
+                          Thread.sleep(1500);
+                      } catch (Exception e) {
+                          say("সমস্যা হয়েছে: " + e.getMessage());
+                          break;
+                      }
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/sumon/ai/MainActivity.java <<'EOF'
+          package com.sumon.ai;
+
+          import android.Manifest;
+          import android.animation.ValueAnimator;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.*;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.*;
+
+          public class MainActivity extends Activity {
+              TextView stat, logv;
+              Orb orb;
+              ScrollView sv;
+              Button run;
+
+              int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density); }
+
+              TextView tv(String t, int sz, int col) {
+                  TextView v = new TextView(this);
+                  v.setText(t); v.setTextSize(sz); v.setTextColor(col);
+                  return v;
+              }
+
+              Button btn(String t, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(t); b.setTextColor(0xFFFFFFFF); b.setOnClickListener(l);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(0xFF1B2358); g.setCornerRadius(dp(14)); g.setStroke(dp(1), 0xFF3B4A9C);
+                  b.setBackground(g);
+                  return b;
+              }
+
+              @Override protected void onCreate(Bundle s) {
+                  super.onCreate(s);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(18), dp(40), dp(18), dp(16));
+                  root.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0xFF05070F, 0xFF0E1236}));
+                  TextView t = tv("SUMON AI", 26, 0xFF22D3EE);
+                  t.setLetterSpacing(0.25f); t.setGravity(Gravity.CENTER);
+                  root.addView(t);
+                  stat = tv("", 14, 0xFF9AA7D6);
+                  stat.setGravity(Gravity.CENTER);
+                  root.addView(stat);
+                  orb = new Orb(this);
+                  orb.setOnClickListener(v -> talk());
+                  root.addView(orb, new LinearLayout.LayoutParams(-1, dp(230)));
+                  sv = new ScrollView(this);
+                  logv = tv("", 15, 0xFFE6EBFF);
+                  sv.addView(logv);
+                  root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
+                  LinearLayout row = new LinearLayout(this);
+                  run = btn("▶ সবসময় চালু", v -> toggle());
+                  row.addView(run, new LinearLayout.LayoutParams(0, -2, 2f));
+                  row.addView(btn("অনুমতি", v -> perms()), new LinearLayout.LayoutParams(0, -2, 1.3f));
+                  row.addView(btn("⚙", v -> settings()), new LinearLayout.LayoutParams(0, -2, 0.8f));
+                  root.addView(row);
+                  setContentView(root);
+              }
+
+              @Override protected void onResume() { super.onResume(); ListenService.ui = this::refresh; refresh(); }
+              @Override protected void onPause() { super.onPause(); ListenService.ui = null; }
+
+              void refresh() {
+                  stat.setText(ListenService.status);
+                  orb.on = ListenService.hot;
+                  synchronized (ListenService.LOG) { logv.setText(ListenService.LOG.toString()); }
+                  sv.post(() -> sv.fullScroll(View.FOCUS_DOWN));
+                  run.setText(ListenService.inst != null ? "■ বন্ধ করুন" : "▶ সবসময় চালু");
+              }
+
+              void toggle() {
+                  if (ListenService.inst != null) { stopService(new Intent(this, ListenService.class)); }
+                  else {
+                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO, "android.permission.POST_NOTIFICATIONS"}, 1);
+                          return;
+                      }
+                      startForegroundService(new Intent(this, ListenService.class));
+                  }
+                  run.postDelayed(this::refresh, 600);
+              }
+
+              @Override public void onRequestPermissionsResult(int c, String[] p, int[] r) {
+                  if (r.length > 0 && r[0] == PackageManager.PERMISSION_GRANTED) toggle();
+              }
+
+              void talk() {
+                  if (ListenService.inst == null) toggle();
+                  else startService(new Intent(this, ListenService.class).setAction("TALK"));
+              }
+
+              void perms() {
+                  new AlertDialog.Builder(this).setTitle("অনুমতি (সবগুলো দিন)")
+                      .setItems(new String[]{"১. মাইক্রোফোন", "২. অন্য অ্যাপের ওপর দেখানো", "৩. অ্যাক্সেসিবিলিটি চালু করুন", "৪. ব্যাটারি সীমা বন্ধ"}, (d, w) -> {
+                          if (w == 0) requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO, "android.permission.POST_NOTIFICATIONS"}, 2);
+                          if (w == 1) startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+                          if (w == 2) startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                          if (w == 3) startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+                      }).show();
+              }
+
+              void settings() {
+                  LinearLayout l = new LinearLayout(this);
+                  l.setOrientation(LinearLayout.VERTICAL);
+                  l.setPadding(dp(20), dp(10), dp(20), 0);
+                  final String[] keys = {"prov", "key", "model", "base", "lang"};
+                  String[] hints = {"Provider: gemini অথবা openai", "API Key", "Model", "Base URL (openai হলে)", "ভাষা: bn-BD / en-US"};
+                  String[] defs = {"gemini", "", "gemini-flash-latest", "https://api.openai.com/v1", "bn-BD"};
+                  final EditText[] e = new EditText[5];
+                  for (int i = 0; i < 5; i++) {
+                      e[i] = new EditText(this);
+                      e[i].setHint(hints[i]); e[i].setText(Ai.get(this, keys[i], defs[i])); e[i].setSingleLine();
+                      l.addView(e[i]);
+                  }
+                  new AlertDialog.Builder(this).setTitle("সেটিংস").setView(l)
+                      .setPositiveButton("সেভ", (d, w) -> { for (int i = 0; i < 5; i++) Ai.put(this, keys[i], e[i].getText().toString().trim()); })
+                      .setNegativeButton("বাতিল", null).show();
+              }
+
+              static class Orb extends View {
+                  Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  float ph;
+                  boolean on;
+                  ValueAnimator va;
+
+                  Orb(Context c) {
+                      super(c);
+                      va = ValueAnimator.ofFloat(0f, 1f);
+                      va.setDuration(1800);
+                      va.setRepeatCount(ValueAnimator.INFINITE);
+                      va.addUpdateListener(a -> { ph = (float) a.getAnimatedValue(); invalidate(); });
+                      va.start();
+                  }
+
+                  @Override protected void onDetachedFromWindow() { va.cancel(); super.onDetachedFromWindow(); }
+
+                  @Override protected void onDraw(Canvas c) {
+                      float cx = getWidth() / 2f, cy = getHeight() / 2f, r = Math.min(cx, cy);
+                      int col = on ? 0xFFFF4DA6 : 0xFF22D3EE;
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(3f);
+                      for (int i = 0; i < 3; i++) {
+                          float f = (ph + i / 3f) % 1f;
+                          p.setColor(col);
+                          p.setAlpha((int) (140 * (1 - f)));
+                          c.drawCircle(cx, cy, r * 0.5f + r * 0.5f * f, p);
+                      }
+                      p.setStyle(Paint.Style.FILL);
+                      p.setShader(new RadialGradient(cx, cy, r * 0.5f, col, 0xFF3B1E8F, Shader.TileMode.CLAMP));
+                      c.drawCircle(cx, cy, r * 0.48f, p);
+                      p.setShader(null);
+                      p.setColor(0xFFFFFFFF);
+                      c.drawRoundRect(cx - r * 0.07f, cy - r * 0.22f, cx + r * 0.07f, cy + r * 0.06f, r * 0.07f, r * 0.07f, p);
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(r * 0.03f);
+                      c.drawArc(cx - r * 0.14f, cy - r * 0.12f, cx + r * 0.14f, cy + r * 0.16f, 0, 180, false, p);
+                      c.drawLine(cx, cy + r * 0.16f, cx, cy + r * 0.24f, p);
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/sumon/ai/PhoneAccessibilityService.java <<'EOF'
+          package com.sumon.ai;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+
+          public class PhoneAccessibilityService extends AccessibilityService {
+              static volatile PhoneAccessibilityService inst;
+
+              @Override protected void onServiceConnected() { inst = this; }
+              @Override public void onAccessibilityEvent(AccessibilityEvent e) { }
+              @Override public void onInterrupt() { }
+              @Override public boolean onUnbind(Intent i) { inst = null; return super.onUnbind(i); }
+
+              static String dump() {
+                  PhoneAccessibilityService s = inst;
+                  if (s == null) return "(accessibility is OFF)";
+                  AccessibilityNodeInfo r = s.getRootInActiveWindow();
+                  if (r == null) return "(empty screen)";
+                  StringBuilder b = new StringBuilder();
+                  walk(r, b);
+                  return b.toString();
+              }
+
+              static void walk(AccessibilityNodeInfo n, StringBuilder b) {
+                  if (n == null || b.length() > 3500) return;
+                  if (n.isVisibleToUser()) {
+                      CharSequence t = n.getText(), c = n.getContentDescription();
+                      String x = t != null ? t.toString() : (c != null ? c.toString() : "");
+                      if (!x.isEmpty() || n.isEditable())
+                          b.append(n.isEditable() ? "[input] " : n.isClickable() ? "[tap] " : "").append(x).append('\n');
+                  }
+                  for (int i = 0; i < n.getChildCount(); i++) walk(n.getChild(i), b);
+              }
+
+              static AccessibilityNodeInfo find(AccessibilityNodeInfo n, String q, boolean editable, boolean scrollable) {
+                  if (n == null) return null;
+                  if (n.isVisibleToUser()) {
+                      if (editable && n.isEditable()) return n;
+                      if (scrollable && n.isScrollable()) return n;
+                      CharSequence t = n.getText(), c = n.getContentDescription();
+                      if (q != null && ((t != null && t.toString().toLowerCase().contains(q)) || (c != null && c.toString().toLowerCase().contains(q)))) return n;
+                  }
+                  for (int i = 0; i < n.getChildCount(); i++) {
+                      AccessibilityNodeInfo r = find(n.getChild(i), q, editable, scrollable);
+                      if (r != null) return r;
+                  }
+                  return null;
+              }
+
+              static boolean click(String q) {
+                  PhoneAccessibilityService s = inst;
+                  if (s == null) return false;
+                  AccessibilityNodeInfo n = find(s.getRootInActiveWindow(), q.toLowerCase(), false, false);
+                  while (n != null && !n.isClickable()) n = n.getParent();
+                  return n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+              }
+
+              static boolean type(String x) {
+                  PhoneAccessibilityService s = inst;
+                  if (s == null) return false;
+                  AccessibilityNodeInfo f = s.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                  if (f == null) f = find(s.getRootInActiveWindow(), null, true, false);
+                  if (f == null) return false;
+                  Bundle b = new Bundle();
+                  b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, x);
+                  return f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
+              }
+
+              static boolean enter() {
+                  PhoneAccessibilityService s = inst;
+                  if (s == null || Build.VERSION.SDK_INT < 30) return false;
+                  AccessibilityNodeInfo f = s.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                  return f != null && f.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.getId());
+              }
+
+              static boolean scroll(boolean down) {
+                  PhoneAccessibilityService s = inst;
+                  if (s == null) return false;
+                  AccessibilityNodeInfo n = find(s.getRootInActiveWindow(), null, false, true);
+                  return n != null && n.performAction(down ? AccessibilityNodeInfo.ACTION_SCROLL_FORWARD : AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD);
+              }
+
+              static boolean glob(int a) {
+                  PhoneAccessibilityService s = inst;
+                  return s != null && s.performGlobalAction(a);
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sumon-ai-apk
+          path: app/build/outputs/apk/debug/*.apk
